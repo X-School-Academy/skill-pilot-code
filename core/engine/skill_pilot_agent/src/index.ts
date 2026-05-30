@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { Agent } from '@openai/agents';
+import { Agent, applyPatchTool } from '@openai/agents';
 import type { AgentInputItem } from '@openai/agents-core';
 import { z } from 'zod';
 import { Command } from 'commander';
@@ -10,11 +10,14 @@ import dotenv from 'dotenv';
 import { createTools } from './tools';
 import { startRepl, type ReplCommand } from './repl';
 import { saveSession, loadSession, listSessions, forkSession } from './session';
-import { loadProviderConfig, resolveModel, listModels } from './providers/config';
+import { loadProviderConfig, resolveModel, listModels, checkApiKey } from './providers/config';
 import { buildOpenAIAgent, runOpenAIAgent } from './providers/openai';
 import { runAnthropicAgent } from './providers/anthropic';
 import { runGeminiAgent } from './providers/gemini';
 import type { ResolvedProvider } from './providers/types';
+import { executeBashStreaming, consumeStreamingOutput } from './streaming/tool-stream';
+import { MCPClient, loadMCPTools } from './mcp/client';
+import type { MCPClientOptions } from './mcp/types';
 
 dotenv.config();
 
@@ -32,6 +35,7 @@ program
   .option('--effort <effort>', 'Reasoning effort: low, medium, high, xhigh')
   .option('--providers-config <path>', 'Path to providers.json config file')
   .option('--approve-tools <yes|no>', 'Require approval before running bash commands', 'no')
+  .option('--mcp-server <json>', 'MCP server config: {"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"]}')
   .argument('[prompt]', 'The user prompt');
 
 program.parse();
@@ -49,6 +53,29 @@ const maxRetries = parseInt(options.maxRetries);
 if (isNaN(maxRetries) || maxRetries <= 0) {
   console.error(`Invalid --max-retries value: ${options.maxRetries}. Must be a positive number.`);
   process.exit(1);
+}
+
+if (options.approveTools !== 'yes' && options.approveTools !== 'no') {
+  console.error(`Invalid --approve-tools value: ${options.approveTools}. Must be 'yes' or 'no'.`);
+  process.exit(1);
+}
+
+// MCP client setup
+let mcpClient: MCPClient | null = null;
+let mcpTools: any[] = [];
+
+let mcpServerConfig: MCPClientOptions | null = null;
+if (options.mcpServer) {
+  try {
+    mcpServerConfig = JSON.parse(options.mcpServer) as MCPClientOptions;
+    if (!mcpServerConfig.command) {
+      console.error('Error: --mcp-server JSON must include "command" field.');
+      process.exit(1);
+    }
+  } catch {
+    console.error('Error: Invalid --mcp-server JSON.');
+    process.exit(1);
+  }
 }
 
 // Tool approval gate
@@ -81,14 +108,14 @@ const providersJsonPath = options.providersConfig
   : path.resolve(__dirname, '../providers.json');
 loadProviderConfig(providersJsonPath);
 
-const model = options.model;
+let model = options.model;
 if (!model) {
   const available = listModels().join(', ');
   console.error(`Error: --model <model> is required. Available: ${available}`);
   process.exit(1);
 }
 
-const resolved = resolveModel(model);
+let resolved = resolveModel(model);
 const effort: string | undefined = options.effort || undefined;
 
 if (effort && resolved.provider.effort_levels.length === 0) {
@@ -104,46 +131,171 @@ function loadInstructions(agentDir: string): string {
   return 'You are a helpful coding assistant named Skill Pilot.';
 }
 
-// Helper to load skills
+// Find .claude/skills/ directories by walking up from agentDir to the filesystem root.
+function findAncestorClaudeSkillsDirs(agentDir: string): string[] {
+  const dirs: string[] = [];
+  const seen = new Set<string>();
+  let current = path.resolve(agentDir);
+
+  while (true) {
+    const candidate = path.join(current, '.claude', 'skills');
+    if (!seen.has(candidate) && fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      dirs.push(candidate);
+    }
+    seen.add(candidate);
+
+    const parent = path.dirname(current);
+    if (parent === current) break; // reached filesystem root
+    current = parent;
+  }
+  return dirs;
+}
+
+// Extract a simple YAML field value (single-line, quoted or unquoted).
+function extractYamlField(fmText: string, field: string): string {
+  const re = new RegExp(`^${field}\\s*:\\s*(.+)$`, 'm');
+  const m = fmText.match(re);
+  if (!m) return '';
+  let val = m[1].trim();
+  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+    val = val.slice(1, -1);
+  }
+  return val;
+}
+
+// Parse simple YAML frontmatter from a markdown string.
+// Returns { name, description, body } or null if no valid frontmatter.
+function parseFrontmatter(content: string): { name: string; description: string; body: string } | null {
+  if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return null;
+
+  const rest = content.slice(content.indexOf('\n') + 1);
+  const endIdx = rest.indexOf('\n---\n');
+  if (endIdx === -1) {
+    const endIdx2 = rest.indexOf('\r\n---\r\n');
+    if (endIdx2 === -1) return null;
+    const fmText = rest.slice(0, endIdx2);
+    const bodyStart = endIdx2 + '\r\n---\r\n'.length;
+    const name = extractYamlField(fmText, 'name');
+    const description = extractYamlField(fmText, 'description');
+    if (!name) return null;
+    return { name, description, body: rest.slice(bodyStart).trim() };
+  }
+
+  const fmText = rest.slice(0, endIdx);
+  const bodyStart = endIdx + '\n---\n'.length;
+  const name = extractYamlField(fmText, 'name');
+  const description = extractYamlField(fmText, 'description');
+  if (!name) return null;
+  return { name, description, body: rest.slice(bodyStart).trim() };
+}
+
+// Load Claude Code-style skills from .claude/skills/<name>/SKILL.md directories.
+function loadClaudeSkills(agentDir: string, allowedSkills?: string): string {
+  const claudeDirs = findAncestorClaudeSkillsDirs(agentDir);
+  if (claudeDirs.length === 0) return '';
+
+  const filter = allowedSkills ? allowedSkills.split(',') : null;
+  let skillInstructions = '';
+
+  for (const claudeDir of claudeDirs) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(claudeDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const skillDirName = entry.name;
+      const skillMdPath = path.join(claudeDir, skillDirName, 'SKILL.md');
+
+      if (!fs.existsSync(skillMdPath)) continue;
+
+      const content = fs.readFileSync(skillMdPath, 'utf8');
+      const parsed = parseFrontmatter(content);
+      if (!parsed) {
+        // No frontmatter — treat the whole file as the skill body, use dir name as skill name
+        if (filter && !filter.some((f) => f === skillDirName)) continue;
+        skillInstructions += `\n--- Skill: ${skillDirName} ---\n${content.trim()}\n`;
+        continue;
+      }
+
+      // Check filter against frontmatter name or directory name
+      if (filter && !filter.some((f) => f === parsed.name || f === skillDirName)) continue;
+
+      const descLine = parsed.description ? `${parsed.description}\n\n` : '';
+      skillInstructions += `\n--- Skill: ${parsed.name} ---\n${descLine}${parsed.body}\n`;
+    }
+  }
+
+  return skillInstructions;
+}
+
+// Helper to load skills from both the --skills-dir path and .claude/skills/.
 function loadSkills(agentDir: string, skillsDir: string, allowedSkills?: string): string {
   const fullSkillsPath = path.resolve(agentDir, skillsDir);
-  if (!fs.existsSync(fullSkillsPath)) return '';
-
-  let skillInstructions = '\n\nAvailable Skills:\n';
   const filter = allowedSkills ? allowedSkills.split(',') : null;
 
-  function scanDir(dir: string): string[] {
-    const results: string[] = [];
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const entryPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        results.push(...scanDir(entryPath));
-      } else if (entry.isFile() && entry.name.endsWith('.md')) {
-        results.push(entryPath);
+  let skillInstructions = '';
+
+  // 1. Scan --skills-dir for .md files
+  if (fs.existsSync(fullSkillsPath)) {
+    function scanDir(dir: string): string[] {
+      const results: string[] = [];
+      let dirEntries: fs.Dirent[];
+      try {
+        dirEntries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return results;
+      }
+      for (const entry of dirEntries) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          results.push(...scanDir(entryPath));
+        } else if (entry.isFile() && entry.name.endsWith('.md')) {
+          results.push(entryPath);
+        }
+      }
+      return results;
+    }
+
+    const mdFiles = scanDir(fullSkillsPath);
+
+    if (mdFiles.length > 0) {
+      skillInstructions += '\n\nAvailable Skills:\n';
+
+      for (const filePath of mdFiles) {
+        const relativeName = path.relative(fullSkillsPath, filePath).replace(/\\/g, '/');
+        const parsedName = path.parse(relativeName).name;
+
+        const dirParts = path.dirname(relativeName).split('/');
+        const matchesFilter = filter
+          ? filter.some((f) => f === parsedName || f === relativeName || dirParts.includes(f))
+          : true;
+        if (!matchesFilter) continue;
+
+        try {
+          const content = fs.readFileSync(filePath, 'utf8');
+          skillInstructions += `\n--- Skill: ${relativeName} ---\n${content}\n`;
+        } catch {
+          // Skip unreadable files
+        }
       }
     }
-    return results;
   }
 
-  const mdFiles = scanDir(fullSkillsPath);
-
-  for (const filePath of mdFiles) {
-    const relativeName = path.relative(fullSkillsPath, filePath).replace(/\\/g, '/');
-    const parsedName = path.parse(relativeName).name;
-
-    const dirParts = path.dirname(relativeName).split('/');
-    const matchesFilter = filter
-      ? filter.some((f) => f === parsedName || f === relativeName || dirParts.includes(f))
-      : true;
-    if (!matchesFilter) continue;
-
-    try {
-      const content = fs.readFileSync(filePath, 'utf8');
-      skillInstructions += `\n--- Skill: ${relativeName} ---\n${content}\n`;
-    } catch {
-      // Skip unreadable files
+  // 2. Load Claude Code-style skills from .claude/skills/
+  const claudeSkills = loadClaudeSkills(agentDir, allowedSkills);
+  if (claudeSkills) {
+    if (skillInstructions) {
+      skillInstructions += '\n';
+    } else {
+      skillInstructions += '\n\nAvailable Skills:\n';
     }
+    skillInstructions += claudeSkills;
   }
+
   return skillInstructions;
 }
 
@@ -210,7 +362,106 @@ const bashTool = {
   run: async (args: { command: string }) => executeBash(args.command),
 };
 
-function buildAgent(): Agent {
+const bashStreamTool = {
+  type: 'function' as const,
+  name: 'bash_stream',
+  description: 'Execute a bash command with real-time streaming output. Use this for long-running commands where you want to see progress.',
+  parameters: z.object({
+    command: z.string().describe('The shell command to execute.'),
+  }),
+  run: async (args: { command: string }) => {
+    const approved = await promptApproval(args.command);
+    if (!approved) return 'Command denied by user.';
+
+    console.log(`\n[STREAM] ${args.command.substring(0, 80)}...`);
+    const stream = executeBashStreaming(args.command, {
+      timeoutMs: timeout * 1000,
+      maxOutputBytes: 100_000,
+      cwd: options.agentDir,
+    });
+
+    return await consumeStreamingOutput(stream, (chunk) => {
+      if (chunk.type === 'stdout' && chunk.data) {
+        process.stdout.write(chunk.data);
+      } else if (chunk.type === 'stderr' && chunk.data) {
+        process.stderr.write(chunk.data);
+      } else if (chunk.type === 'error' && chunk.data) {
+        console.error(`\n[ERROR] ${chunk.data}`);
+      }
+    });
+  },
+};
+
+// apply_patch editor -- implements the Editor interface for local filesystem V4A diffs.
+function createLocalEditor(agentDir: string) {
+  function resolveOpPath(filePath: string): string {
+    if (path.isAbsolute(filePath)) return filePath;
+    return path.resolve(agentDir, filePath);
+  }
+
+  /** Parse a V4A diff string into an array of {search, replace} blocks. */
+  function parseV4ADiff(diff: string): { search: string; replace: string }[] {
+    const blocks: { search: string; replace: string }[] = [];
+    const marker = '<<<<<<< SEARCH';
+    let idx = 0;
+    while ((idx = diff.indexOf(marker, idx)) !== -1) {
+      const searchContentStart = diff.indexOf('\n', idx + marker.length);
+      if (searchContentStart === -1) break;
+      const separator = diff.indexOf('\n=======', searchContentStart);
+      if (separator === -1) break;
+      const replaceEnd = diff.indexOf('\n>>>>>>> REPLACE', separator);
+      if (replaceEnd === -1) break;
+      const search = diff.substring(searchContentStart + 1, separator);
+      const replace = diff.substring(separator + '\n======='.length + 1, replaceEnd);
+      blocks.push({ search, replace });
+      idx = replaceEnd + '\n>>>>>>> REPLACE'.length;
+    }
+    return blocks;
+  }
+
+  return {
+    async createFile(operation: { path: string; diff: string }) {
+      const fullPath = resolveOpPath(operation.path);
+      const dir = path.dirname(fullPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(fullPath, operation.diff, 'utf8');
+      return { status: 'completed' as const, output: `Created ${operation.path}` };
+    },
+
+    async updateFile(operation: { path: string; diff: string }) {
+      const fullPath = resolveOpPath(operation.path);
+      if (!fs.existsSync(fullPath)) {
+        return { status: 'failed' as const, output: `File not found: ${operation.path}` };
+      }
+      let content = fs.readFileSync(fullPath, 'utf8');
+      const blocks = parseV4ADiff(operation.diff);
+      if (blocks.length === 0) {
+        return { status: 'failed' as const, output: 'No valid SEARCH/REPLACE blocks found in diff.' };
+      }
+      for (const { search, replace } of blocks) {
+        if (!content.includes(search)) {
+          return { status: 'failed' as const, output: `Search block not found in ${operation.path}: "${search.substring(0, 100)}"` };
+        }
+        content = content.replace(search, replace);
+      }
+      fs.writeFileSync(fullPath, content, 'utf8');
+      return { status: 'completed' as const, output: `Updated ${operation.path}` };
+    },
+
+    async deleteFile(operation: { path: string }) {
+      const fullPath = resolveOpPath(operation.path);
+      if (!fs.existsSync(fullPath)) {
+        return { status: 'failed' as const, output: `File not found: ${operation.path}` };
+      }
+      fs.unlinkSync(fullPath);
+      return { status: 'completed' as const, output: `Deleted ${operation.path}` };
+    },
+  };
+}
+
+const patchTool = applyPatchTool({ editor: createLocalEditor(options.agentDir) });
+
+async function buildAgent(): Promise<Agent> {
   const instructions = loadInstructions(options.agentDir);
   const skillInstructions = loadSkills(options.agentDir, options.skillsDir, options.skills);
 
@@ -224,10 +475,10 @@ When working on a task:
 
   const fileTools = createTools(options.agentDir);
 
-  return buildOpenAIAgent(
+  return await buildOpenAIAgent(
     resolved,
     instructions + multiTurnPrompt + skillInstructions,
-    [bashTool as any, ...fileTools.map((t) => t as any)],
+    [patchTool as any, bashTool as any, bashStreamTool as any, ...fileTools.map((t) => t as any), ...mcpTools],
     effort,
   );
 }
@@ -236,12 +487,14 @@ async function runAgentStream(
   prompt: string,
   conversation: AgentInputItem[],
 ): Promise<AgentInputItem[]> {
+  checkApiKey(resolved);
+
   const instructions = loadInstructions(options.agentDir);
   const skillInstructions = loadSkills(options.agentDir, options.skillsDir, options.skills);
   const systemPrompt = instructions + skillInstructions;
 
   if (resolved.provider.protocol === 'openai') {
-    const agent = buildAgent();
+    const agent = await buildAgent();
     const { stream, collectedItems } = await runOpenAIAgent(
       agent,
       prompt,
@@ -253,7 +506,7 @@ async function runAgentStream(
 
   // Non-OpenAI adapters
   const fileTools = createTools(options.agentDir);
-  const allTools = [bashTool as any, ...fileTools.map((t) => t as any)];
+  const allTools = [patchTool as any, bashTool as any, bashStreamTool as any, ...fileTools.map((t) => t as any), ...mcpTools];
   const collectedItems: AgentInputItem[] = [...conversation];
 
   const adapterStream =
@@ -289,11 +542,11 @@ async function consumeStream(
     for await (const event of stream) {
       const evt = event as any;
 
-      if (evt.type === 'raw_model_stream') {
+      if (evt.type === 'raw_model_stream_event') {
         if (evt.data?.delta) {
           process.stdout.write(evt.data.delta);
         }
-      } else if (evt.type === 'run_item_stream') {
+      } else if (evt.type === 'run_item_stream_event') {
         const item = evt.item;
         if (item) {
           collectedItems.push(item);
@@ -304,7 +557,7 @@ async function consumeStream(
             console.log(`[RESULT] ${output}`);
           }
         }
-      } else if (evt.type === 'agent_updated') {
+      } else if (evt.type === 'agent_updated_stream_event') {
         // Agent handoff — no-op for now
       }
     }
@@ -330,7 +583,29 @@ async function main() {
       process.exit(0);
     }
 
-    console.log(`Skill Pilot spcode starting session with model: ${model} (provider: ${resolved.provider.id})`);
+    // Connect to MCP server and load tools
+    if (mcpServerConfig) {
+      mcpClient = new MCPClient(mcpServerConfig);
+      try {
+        await mcpClient.connect();
+        mcpTools = await loadMCPTools(mcpClient);
+        console.error(`Loaded ${mcpTools.length} MCP tools from ${mcpServerConfig.command}`);
+      } catch (err: any) {
+        console.error(`Warning: Failed to load MCP tools: ${err.message}`);
+        mcpClient = null;
+        mcpTools = [];
+      }
+    }
+
+    // Cleanup MCP client on exit
+    process.on('exit', () => {
+      if (mcpClient) {
+        mcpClient.disconnect();
+      }
+    });
+
+    const mcpInfo = mcpTools.length > 0 ? ` | MCP tools: ${mcpTools.length}` : '';
+    console.log(`Skill Pilot spcode starting session with model: ${model} (provider: ${resolved.provider.id})${mcpInfo}`);
 
     let conversation: AgentInputItem[] = [];
     let sessionId: string | null = null;
@@ -339,8 +614,13 @@ async function main() {
       switch (cmd.type) {
         case 'prompt':
           console.log('');
-          conversation = await runAgentStream(cmd.text, conversation.length > 0 ? conversation : []);
-          if (sessionId) saveSession(sessionId, conversation);
+          try {
+            conversation = await runAgentStream(cmd.text, conversation.length > 0 ? conversation : []);
+            if (sessionId) saveSession(sessionId, conversation);
+          } catch (err: any) {
+            console.error(`\n[ERROR] ${err.message || err}`);
+            console.error('Session continues. You can try again or /model to switch providers.\n');
+          }
           break;
 
         case 'save':
@@ -381,8 +661,66 @@ async function main() {
           break;
 
         case 'help':
-          console.log('/exit | /clear | /save | /load <id> | /fork <id> | /list');
+          console.log('/exit | /clear | /save | /load <id> | /fork <id> | /list | /models | /model <name> | /tools');
           break;
+
+        case 'models': {
+          const allModels = listModels();
+          console.log('\nAvailable models:');
+          // Re-read providers.json to map models to providers
+          try {
+            const raw = fs.readFileSync(providersJsonPath, 'utf8');
+            const data = JSON.parse(raw);
+            for (const provider of data.providers) {
+              for (const m of provider.models) {
+                const marker = m === model ? ' (current)' : '';
+                console.log(`  ${m.padEnd(22)} [${provider.id}]${marker}`);
+              }
+            }
+          } catch {
+            for (const m of allModels) {
+              const marker = m === model ? ' (current)' : '';
+              console.log(`  ${m}${marker}`);
+            }
+          }
+          console.log('');
+          break;
+        }
+
+        case 'tools': {
+          const fileTools = createTools(options.agentDir);
+          const allToolNames = [
+            'apply_patch',
+            'bash',
+            'bash_stream',
+            ...fileTools.map((t: any) => t.name),
+            ...mcpTools.map((t: any) => t.name),
+          ];
+          console.log(`\nAvailable tools (${allToolNames.length}):`);
+          for (const name of allToolNames) {
+            console.log(`  ${name}`);
+          }
+          console.log('');
+          break;
+        }
+
+        case 'switch-model': {
+          const allModels = listModels();
+          if (!allModels.includes(cmd.model)) {
+            console.log(`\nUnknown model '${cmd.model}'. Available models:`);
+            for (const m of allModels) {
+              console.log(`  ${m}`);
+            }
+            console.log('');
+            break;
+          }
+          const newResolved = resolveModel(cmd.model);
+          checkApiKey(newResolved);
+          resolved = newResolved;
+          model = cmd.model;
+          console.log(`\nSwitched to model: ${model} (provider: ${resolved.provider.id})\n`);
+          break;
+        }
 
         case 'exit':
           break;
@@ -392,7 +730,25 @@ async function main() {
   }
 
   // One-shot mode — user provided a prompt
-  console.log(`Skill Pilot spcode starting session with model: ${model} (provider: ${resolved.provider.id})`);
+  // Connect to MCP server and load tools (one-shot mode)
+  if (mcpServerConfig && !mcpClient) {
+    mcpClient = new MCPClient(mcpServerConfig);
+    try {
+      await mcpClient.connect();
+      mcpTools = await loadMCPTools(mcpClient);
+      console.error(`Loaded ${mcpTools.length} MCP tools from ${mcpServerConfig.command}`);
+    } catch (err: any) {
+      console.error(`Warning: Failed to load MCP tools: ${err.message}`);
+      mcpClient = null;
+      mcpTools = [];
+    }
+    process.on('exit', () => {
+      if (mcpClient) mcpClient.disconnect();
+    });
+  }
+
+  const mcpInfoOneShot = mcpTools.length > 0 ? ` | MCP tools: ${mcpTools.length}` : '';
+  console.log(`Skill Pilot spcode starting session with model: ${model} (provider: ${resolved.provider.id})${mcpInfoOneShot}`);
 
   try {
     const conversation = await runAgentStream(userPrompt, []);
