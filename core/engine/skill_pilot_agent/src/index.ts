@@ -1,3 +1,5 @@
+import { patchToolParameters } from './patches/sdk-patch';
+
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -18,6 +20,7 @@ import type { ResolvedProvider } from './providers/types';
 import { executeBashStreaming, consumeStreamingOutput } from './streaming/tool-stream';
 import { MCPClient, loadMCPTools } from './mcp/client';
 import type { MCPClientOptions } from './mcp/types';
+import { WatchLoop, type WatchConfig } from './watcher';
 
 dotenv.config();
 
@@ -36,6 +39,11 @@ program
   .option('--providers-config <path>', 'Path to providers.json config file')
   .option('--approve-tools <yes|no>', 'Require approval before running bash commands', 'no')
   .option('--mcp-server <json>', 'MCP server config: {"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"]}')
+  .option('--watch', 'Enable live coding watch mode')
+  .option('--watch-paths <paths>', 'Comma-separated paths to watch', 'src/')
+  .option('--watch-debounce <ms>', 'Debounce window in ms', '2000')
+  .option('--watch-max-retries <number>', 'Max fix attempts per change batch', '3')
+  .option('--watch-auto-commit <yes|no>', 'Auto-commit after successful fix', 'yes')
   .argument('[prompt]', 'The user prompt');
 
 program.parse();
@@ -77,6 +85,19 @@ if (options.mcpServer) {
     process.exit(1);
   }
 }
+
+// Watch mode validation
+const watchDebounce = parseInt(options.watchDebounce);
+if (isNaN(watchDebounce) || watchDebounce < 100) {
+  console.error(`Invalid --watch-debounce value: ${options.watchDebounce}. Must be >= 100ms.`);
+  process.exit(1);
+}
+const watchMaxRetries = parseInt(options.watchMaxRetries);
+if (isNaN(watchMaxRetries) || watchMaxRetries < 1) {
+  console.error(`Invalid --watch-max-retries value: ${options.watchMaxRetries}. Must be >= 1.`);
+  process.exit(1);
+}
+const watchAutoCommit = options.watchAutoCommit !== 'no';
 
 // Tool approval gate
 const requireApproval = options.approveTools === 'yes';
@@ -356,20 +377,28 @@ const bashTool = {
   type: 'function' as const,
   name: 'bash',
   description: 'Execute a bash command on the system. Use this to read files, run tests, or modify code.',
+  needsApproval: async () => requireApproval,
   parameters: z.object({
     command: z.string().describe('The shell command to execute.'),
   }),
-  run: async (args: { command: string }) => executeBash(args.command),
+  invoke: async (_runContext: any, input: any) => {
+    let args: any = input;
+    if (typeof input === 'string') { try { args = JSON.parse(input); } catch {} }
+    return executeBash(args.command);
+  },
 };
 
 const bashStreamTool = {
   type: 'function' as const,
   name: 'bash_stream',
   description: 'Execute a bash command with real-time streaming output. Use this for long-running commands where you want to see progress.',
+  needsApproval: async () => requireApproval,
   parameters: z.object({
     command: z.string().describe('The shell command to execute.'),
   }),
-  run: async (args: { command: string }) => {
+  invoke: async (_runContext: any, input: any) => {
+    let args: any = input;
+    if (typeof input === 'string') { try { args = JSON.parse(input); } catch {} }
     const approved = await promptApproval(args.command);
     if (!approved) return 'Command denied by user.';
 
@@ -474,11 +503,18 @@ When working on a task:
 `;
 
   const fileTools = createTools(options.agentDir);
+  const isRealOpenAI = resolved.provider.id === 'openai';
+
+  // apply_patch is a hosted tool — only works with OpenAI's Responses API.
+  const hostedTools = isRealOpenAI ? [patchTool as any] : [];
+
+  const allBuiltTools = [...hostedTools, bashTool as any, bashStreamTool as any, ...fileTools.map((t) => t as any), ...mcpTools];
+  patchToolParameters(allBuiltTools);
 
   return await buildOpenAIAgent(
     resolved,
     instructions + multiTurnPrompt + skillInstructions,
-    [patchTool as any, bashTool as any, bashStreamTool as any, ...fileTools.map((t) => t as any), ...mcpTools],
+    allBuiltTools,
     effort,
   );
 }
@@ -506,7 +542,8 @@ async function runAgentStream(
 
   // Non-OpenAI adapters
   const fileTools = createTools(options.agentDir);
-  const allTools = [patchTool as any, bashTool as any, bashStreamTool as any, ...fileTools.map((t) => t as any), ...mcpTools];
+  const allTools = [bashTool as any, bashStreamTool as any, ...fileTools.map((t) => t as any), ...mcpTools];
+  patchToolParameters(allTools);
   const collectedItems: AgentInputItem[] = [...conversation];
 
   const adapterStream =
@@ -573,12 +610,41 @@ async function consumeStream(
 
 // Main execution
 async function main() {
+  // Watch mode state (in main() closure so REPL handlers can access)
+  let watchConfig = WatchLoop.loadConfig(options.agentDir, {
+    paths: options.watchPaths.split(',').map((p: string) => p.trim()).filter(Boolean),
+    debounceMs: watchDebounce,
+    maxRetries: watchMaxRetries,
+    autoCommit: watchAutoCommit,
+    model: model,
+  });
+  let watchLoop: WatchLoop | null = null;
+  const defaultWatchPaths = [...watchConfig.paths]; // snapshot original CLI defaults
+
+  // Graceful shutdown for watch mode
+  process.on('SIGINT', () => {
+    if (watchLoop && watchLoop.isRunning()) {
+      watchLoop.stop();
+    }
+    process.exit(0);
+  });
+
   const instructions = loadInstructions(options.agentDir);
   const skillInstructions = loadSkills(options.agentDir, options.skillsDir, options.skills);
 
-  // No prompt + TTY → REPL mode. No prompt + pipe → show help.
+  // No prompt + TTY → REPL mode. No prompt + no --watch → show help.
   if (!userPrompt) {
     if (!process.stdin.isTTY) {
+      // --watch in headless mode (no TTY, background daemon)
+      if (options.watch) {
+        console.error('Skill Pilot spcode watching with model: ' + model + ' (provider: ' + resolved.provider.id + ')');
+        watchLoop = new WatchLoop(watchConfig);
+        watchLoop.start();
+        process.on('SIGINT', function() { if (watchLoop) watchLoop.stop(); process.exit(0); });
+        process.on('SIGTERM', function() { if (watchLoop) watchLoop.stop(); process.exit(0); });
+        setInterval(function() {}, 60000); // keep event loop alive
+        return;
+      }
       program.help();
       process.exit(0);
     }
@@ -609,6 +675,12 @@ async function main() {
 
     let conversation: AgentInputItem[] = [];
     let sessionId: string | null = null;
+
+    // If --watch flag, auto-start watcher before REPL
+    if (options.watch) {
+      watchLoop = new WatchLoop(watchConfig);
+      watchLoop.start();
+    }
 
     startRepl(async (cmd: ReplCommand) => {
       switch (cmd.type) {
@@ -661,7 +733,7 @@ async function main() {
           break;
 
         case 'help':
-          console.log('/exit | /clear | /save | /load <id> | /fork <id> | /list | /models | /model <name> | /tools');
+          console.log('/exit | /clear | /save | /load <id> | /fork <id> | /list | /models | /model <name> | /tools | /fix | /watch');
           break;
 
         case 'models': {
@@ -719,6 +791,56 @@ async function main() {
           resolved = newResolved;
           model = cmd.model;
           console.log(`\nSwitched to model: ${model} (provider: ${resolved.provider.id})\n`);
+          break;
+        }
+
+        case 'watch-on': {
+          if (cmd.paths && cmd.paths.length > 0) {
+            console.log(`\nStarting watch on: ${cmd.paths.join(', ')}`);
+            watchConfig.paths = cmd.paths;
+          } else {
+            watchConfig.paths = [...defaultWatchPaths]; // reset to CLI defaults
+          }
+          if (watchLoop && watchLoop.isRunning()) {
+            watchLoop.stop();
+          }
+          watchConfig.model = model;
+          watchLoop = new WatchLoop(watchConfig);
+          watchLoop.start();
+          break;
+        }
+
+        case 'watch-off': {
+          if (watchLoop && watchLoop.isRunning()) {
+            watchLoop.stop();
+            watchLoop = null;
+            console.log('Watch stopped.');
+          } else {
+            console.log('Watch is not running.');
+          }
+          break;
+        }
+
+        case 'watch-status': {
+          if (watchLoop && watchLoop.isRunning()) {
+            console.log(watchLoop.getStatus());
+          } else {
+            console.log('Watch is not running.');
+          }
+          break;
+        }
+
+        case 'fix': {
+          var fixPaths = cmd.paths && cmd.paths.length > 0 ? cmd.paths : watchConfig.paths;
+          console.log('\nRunning fix cycle on: ' + fixPaths.join(', ') + '...');
+          var fixCfg = { paths: fixPaths, debounceMs: watchConfig.debounceMs, maxRetries: watchConfig.maxRetries, autoCommit: false, model: model, agentDir: watchConfig.agentDir };
+          var fixLoop = new WatchLoop(fixCfg);
+          try {
+            await fixLoop.runFixCycle(fixPaths);
+          } catch (err: any) {
+            console.error('Fix cycle error: ' + (err.message || err));
+          }
+          console.log('Fix cycle complete.\n');
           break;
         }
 
